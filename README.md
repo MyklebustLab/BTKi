@@ -1,5 +1,5 @@
 # BTKi
-Cellular responses to BTK inhibitors and degraders in chronic lymphocytic leukemia
+**Cellular responses to BTK inhibitors and degraders in chronic lymphocytic leukemia**
 
 Tora Brådland1, Ninni E. Olafsen1, Ankush Sharma1,2, Andrea Lenartova3, June H. Myklebust1,2, Geir E. Tjønnfjord3,4, Kjetil Taskén1,4, Sigrid S. Skånland1,†
 
