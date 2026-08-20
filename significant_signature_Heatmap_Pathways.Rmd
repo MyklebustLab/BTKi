@@ -1,0 +1,1140 @@
+---
+title: "Cellular responses to BTK inhibitors and degraders in chronic lymphocytic leukemia"
+Author: "Tora Brådland, Ninni E. Olafsen, Ankush Sharma, Andrea Lenartova, June H. Myklebust, Geir E. Tjønnfjord, Kjetil Taskén, Sigrid S. Skånland"
+AnalysisPerformed: "Ankush Sharma"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    self_contained: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  dev = "png",
+  dpi = 180
+)
+
+suppressPackageStartupMessages({
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+  library(readxl)
+  library(DESeq2)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(fgsea)
+  library(msigdbr)
+  library(dplyr)
+  library(tidyr)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(magick)
+  library(grid)
+})
+```
+
+# Goal
+
+This report uses matched **DMSO/DM** samples as the within-patient baseline. Heatmaps display only the active drug-treatment columns, ordered by drug class:
+
+1. DMSO: `DM`
+2. Covalent BTK inhibitors: `IB`, `AC`, `ZA`
+3. Non-covalent BTK inhibitors: `PI`, `NE`
+4. Dual covalent/non-covalent: `RO`
+5. Degraders: `NX` / Zelebrudomide, `BG` / Tacabrutideg
+
+Individual-treatment heatmaps use full drug names as the column-group titles. Treatment-class heatmaps summarize each patient by treatment class. Treatment class is shown as a colored annotation strip using the class palette requested for the final figures.
+
+It avoids the previous centroid-similarity approach. The non-signature analysis is now independent: genes are selected by treatment responsiveness and then grouped by the drug class where they show the strongest treatment-vs-DM delta profile.
+
+The paired differential expression model is:
+
+```r
+full model:    ~ patient + treatment
+reduced model: ~ patient
+```
+
+This tests treatment-induced changes after blocking patient baseline expression.
+
+This shortened copy keeps the code through the manuscript-focused heatmap and pathway-dotplot figures:
+
+- significant NF-KB/BCR/MYC signature-gene heatmaps,
+- individual pathway dot plots for Hallmark, Reactome, and GO Biological Process collections,
+- the compact Hallmark top-12 dot plot,
+- the compact combined heatmap + Hallmark top-12 panel.
+
+Downstream exploratory sections from the full report are intentionally removed from this copy.
+
+# Inputs, order, and palettes
+
+```{r paths-and-palettes}
+# knitr::current_input() is available while knitting, but it can be NULL when
+# chunks are run manually in RStudio. This helper finds the analysis folder from
+# either context by looking for the expected count-matrix directory.
+find_analysis_dir <- function() {
+  input_file <- knitr::current_input()
+  starts <- getwd()
+  if (!is.null(input_file) && length(input_file) == 1 && !is.na(input_file) && nzchar(input_file)) {
+    starts <- c(dirname(normalizePath(input_file, mustWork = TRUE)), starts)
+  }
+
+  candidates <- unique(normalizePath(
+    c(starts, file.path(starts, ".."), file.path(starts, "..", "..")),
+    mustWork = FALSE
+  ))
+
+  for (candidate in candidates) {
+    marker <- file.path(candidate, "02_count_matrices", "final_featurecounts", "sample_metadata.tsv")
+    if (file.exists(marker)) return(candidate)
+  }
+
+  stop(
+    "Please check and Setwd to Analysis20260720 folder ",
+    "Analysis20260720 or to 03_reports/current before running this chunk."
+  )
+}
+
+base_dir <- find_analysis_dir()
+report_dir <- file.path(base_dir, "03_reports", "current")
+input_dir <- normalizePath(file.path(base_dir, "..", "InputReadCounts"))
+count_dir <- file.path(base_dir, "02_count_matrices", "final_featurecounts")
+figure_dir <- file.path(base_dir, "04_final_figures", "treatment_class_independent")
+table_dir <- file.path(base_dir, "05_results_tables", "treatment_class_independent")
+pathway_figure_dir <- file.path(base_dir, "04_final_figures", "pathway_analysis")
+pathway_table_dir <- file.path(base_dir, "05_results_tables", "pathway_analysis")
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(pathway_figure_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(pathway_table_dir, recursive = TRUE, showWarnings = FALSE)
+
+signature_file <- file.path(input_dir, "GeneSignatures_blood_bld-2022-016934-mmc2.xlsx")
+count_file <- file.path(count_dir, "featurecounts_count_matrix_annotated_hgnc.tsv")
+metadata_file <- file.path(count_dir, "sample_metadata.tsv")
+
+signature_levels <- c("NF-KB", "BCR", "MYC")
+treatment_levels <- c("DM", "IB", "AC", "ZA", "PI", "NE", "RO", "NX", "BG")
+patient_levels <- c("CLL149", "CLL177", "CLL260")
+treatment_class_levels <- c("DMSO", "Covalent", "Non-covalent", "Dual", "Degrader")
+
+drug_info <- data.frame(
+  treatment = factor(treatment_levels, levels = treatment_levels),
+  drug_name = c(
+    "DMSO",
+    "Ibrutinib",
+    "Acalabrutinib",
+    "Zanubrutinib",
+    "Pirtobrutinib",
+    "Nemtabrutinib",
+    "Rocbrutinib",
+    "Zelebrudomide",
+    "Tacabrutideg"
+  ),
+  drug_label = c(
+    "DMSO",
+    "Ibrutinib",
+    "Acalabrutinib",
+    "Zanubrutinib",
+    "Pirtobrutinib",
+    "Nemtabrutinib",
+    "Rocbrutinib",
+    "Zelebrudomide",
+    "Tacabrutideg"
+  ),
+  treatment_class = factor(
+    c("DMSO", "Covalent", "Covalent", "Covalent", "Non-covalent", "Non-covalent", "Dual", "Degrader", "Degrader"),
+    levels = treatment_class_levels
+  )
+)
+
+treatment_colors <- c(
+  AC = "#1B3398",
+  BG = "#7E8C00",
+  DM = "#A30000",
+  IB = "#C800A8",
+  NE = "#D414E5",
+  NX = "#0F927F",
+  PI = "#E86C00",
+  RO = "#153F80",
+  ZA = "#4E67D8"
+)
+
+patient_colors <- c(
+  CLL149 = "#E7AE00",
+  CLL177 = "#149CA3",
+  CLL260 = "#5121B4"
+)
+
+signature_colors <- c(
+  "NF-KB" = "#21B7E5",
+  BCR = "#F05B9C",
+  MYC = "#F67552"
+)
+
+treatment_class_colors <- c(
+  DMSO = "#A30000",
+  Covalent = "#F0B0BC",
+  `Non-covalent` = "#A0DEEE",
+  Dual = "#B498E0",
+  Degrader = "#7BCE92"
+)
+
+origin_colors <- c(
+  Signature = "#5A5A5A",
+  `Non-signature` = "#C7C7C7"
+)
+```
+
+# Read count matrix and metadata
+
+```{r read-data}
+metadata <- read.delim(metadata_file, sep = "\t", check.names = FALSE, stringsAsFactors = FALSE) |>
+  mutate(
+    sample_id = as.character(sample_id),
+    patient = factor(patient, levels = patient_levels),
+    treatment = factor(treatment, levels = treatment_levels)
+  ) |>
+  left_join(drug_info, by = "treatment") |>
+  arrange(treatment, patient)
+
+sample_cols <- metadata$sample_id
+
+counts <- read.delim(count_file, sep = "\t", check.names = FALSE, stringsAsFactors = FALSE) |>
+  mutate(
+    gene_symbol = ifelse(is.na(gene_symbol), "", gene_symbol),
+    gene_symbol_upper = toupper(gene_symbol)
+  )
+
+stopifnot(all(sample_cols %in% names(counts)))
+
+signatures <- readxl::read_excel(signature_file, sheet = 1) |>
+  as.data.frame() |>
+  transmute(
+    signature = as.character(Signature),
+    signature_gene = trimws(as.character(Gene))
+  ) |>
+  filter(!is.na(signature_gene), signature_gene != "") |>
+  distinct()
+
+table(metadata$treatment, metadata$patient)
+table(signatures$signature)
+```
+
+# Resolve signature symbols
+
+Some workbook symbols use older names or dot notation. These are resolved by direct matching, dot-to-hyphen matching, and `org.Hs.eg.db` alias mapping.
+
+```{r resolve-signature-symbols}
+available_symbols <- counts$gene_symbol[counts$gene_symbol != ""]
+available_upper_to_symbol <- setNames(available_symbols, toupper(available_symbols))
+
+candidate_genes <- unique(c(signatures$signature_gene, gsub("\\.", "-", signatures$signature_gene)))
+alias_map <- AnnotationDbi::mapIds(
+  org.Hs.eg.db,
+  keys = candidate_genes,
+  keytype = "ALIAS",
+  column = "SYMBOL",
+  multiVals = "first"
+)
+
+resolve_gene <- function(gene) {
+  candidates <- unique(c(
+    gene,
+    gsub("\\.", "-", gene),
+    unname(alias_map[gene]),
+    unname(alias_map[gsub("\\.", "-", gene)])
+  ))
+  candidates <- candidates[!is.na(candidates) & candidates != ""]
+  matched <- toupper(candidates)
+  matched <- matched[matched %in% names(available_upper_to_symbol)]
+  if (length(matched) == 0) return(NA_character_)
+  unname(available_upper_to_symbol[matched[1]])
+}
+
+gene_map <- signatures |>
+  mutate(
+    matched_gene_symbol = vapply(signature_gene, resolve_gene, character(1)),
+    match_status = ifelse(is.na(matched_gene_symbol), "unmatched", "matched")
+  )
+
+matched_map <- gene_map |>
+  filter(match_status == "matched") |>
+  mutate(signature = factor(signature, levels = signature_levels))
+
+write.table(
+  gene_map,
+  file.path(table_dir, "signature_gene_match_summary.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+gene_map |>
+  count(match_status)
+```
+
+# Collapse counts and calculate log2 CPM
+
+DESeq2 uses raw counts. log2 CPM is used only for heatmap deltas and profile summaries.
+
+```{r normalize}
+counts_collapsed <- counts |>
+  filter(gene_symbol != "") |>
+  mutate(mean_count = rowMeans(across(all_of(sample_cols)), na.rm = TRUE)) |>
+  group_by(gene_symbol) |>
+  slice_max(mean_count, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(Geneid, ensembl_id, gene_symbol, gene_name, gene_type, all_of(sample_cols))
+
+raw_counts_all <- as.matrix(counts_collapsed[, sample_cols])
+mode(raw_counts_all) <- "integer"
+rownames(raw_counts_all) <- counts_collapsed$gene_symbol
+
+library_sizes <- colSums(raw_counts_all)
+log_cpm_all <- log2(t(t(raw_counts_all) / library_sizes * 1e6) + 1)
+
+c(n_genes_with_symbols = nrow(raw_counts_all), n_samples = ncol(raw_counts_all))
+```
+
+# Paired DESeq2 treatment test for all genes
+
+This all-gene test is used for both signature and non-signature selections.
+
+```{r deseq2-all-genes}
+coldata <- metadata |>
+  select(sample_id, patient, treatment) |>
+  as.data.frame()
+rownames(coldata) <- coldata$sample_id
+coldata$sample_id <- NULL
+coldata$patient <- factor(coldata$patient, levels = patient_levels)
+coldata$treatment <- relevel(factor(coldata$treatment, levels = treatment_levels), ref = "DM")
+
+dds_all <- DESeqDataSetFromMatrix(
+  countData = round(raw_counts_all),
+  colData = coldata,
+  design = ~ patient + treatment
+)
+keep <- rowSums(counts(dds_all) >= 10) >= 3
+dds_all <- dds_all[keep, ]
+dds_all <- DESeq(dds_all, test = "LRT", reduced = ~ patient, quiet = TRUE)
+
+# The LRT above asks whether each gene changes in any treatment. For treatment-
+# specific ranked gene lists, fit the same paired design with Wald tests so each
+# treatment-vs-DMSO contrast receives its own statistic and FDR.
+dds_wald <- DESeqDataSetFromMatrix(
+  countData = round(raw_counts_all),
+  colData = coldata,
+  design = ~ patient + treatment
+)
+dds_wald <- dds_wald[keep, ]
+dds_wald <- DESeq(dds_wald, test = "Wald", quiet = TRUE)
+
+all_lrt <- results(dds_all) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("gene_symbol") |>
+  left_join(counts_collapsed |> select(gene_symbol, Geneid, ensembl_id, gene_name, gene_type), by = "gene_symbol") |>
+  select(gene_symbol, Geneid, ensembl_id, gene_name, gene_type, baseMean, stat, pvalue, padj)
+
+wald_tables <- lapply(setdiff(treatment_levels, "DM"), function(treatment) {
+  coefficient <- paste0("treatment_", treatment, "_vs_DM")
+  results(dds_wald, name = coefficient) |>
+    as.data.frame() |>
+    tibble::rownames_to_column("gene_symbol") |>
+    transmute(
+      gene_symbol,
+      treatment,
+      log2FoldChange,
+      lfcSE,
+      stat,
+      pvalue,
+      padj
+    )
+}) |>
+  bind_rows()
+
+write.table(all_lrt, file.path(table_dir, "all_gene_treatment_lrt_statistics.tsv"), sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(wald_tables, file.path(table_dir, "all_gene_each_treatment_vs_DM_statistics.tsv"), sep = "\t", quote = FALSE, row.names = FALSE)
+
+summary(all_lrt$padj)
+```
+
+# Helper functions
+
+```{r helper-functions}
+make_delta_long <- function(gene_symbols, row_map = NULL) {
+  # Convert the normalized expression matrix to long format and attach sample metadata.
+  # The key transformation is delta_log2_cpm_vs_DM: each treated sample is compared
+  # only to the matched DMSO sample from the same patient.
+  x <- as.data.frame(log_cpm_all[gene_symbols, sample_cols, drop = FALSE], check.names = FALSE) |>
+    tibble::rownames_to_column("gene_symbol") |>
+    pivot_longer(all_of(sample_cols), names_to = "sample_id", values_to = "log2_cpm") |>
+    left_join(metadata, by = "sample_id")
+
+  if (!is.null(row_map)) {
+    x <- x |>
+      left_join(row_map, by = "gene_symbol", relationship = "many-to-many")
+  }
+
+  ref <- x |>
+    filter(treatment == "DM") |>
+    select(any_of(c("signature", "signature_gene", "origin", "best_class", "best_treatment", "direction")), gene_symbol, patient, dm_log2_cpm = log2_cpm)
+
+  join_keys <- intersect(c("signature", "signature_gene", "origin", "best_class", "best_treatment", "direction", "gene_symbol", "patient"), names(ref))
+
+  x |>
+    left_join(ref, by = join_keys) |>
+    mutate(
+      delta_log2_cpm_vs_DM = log2_cpm - dm_log2_cpm,
+      column_id = paste(patient, treatment, sep = "_")
+    )
+}
+
+draw_delta_heatmap <- function(
+  mat,
+  row_split,
+  row_colors,
+  file_stub,
+  row_font = 6,
+  extra_row_anno = NULL,
+  plot_width = 13.8,
+  column_title_font = 9,
+  column_name_font = 8,
+  top_padding_mm = 22,
+  show_row_annotation_name = TRUE,
+  color_limit = 4,
+  legend_side = "right",
+  include_dm = FALSE
+) {
+  plot_metadata <- metadata
+  plot_drug_info <- drug_info
+  if (!include_dm) {
+    plot_metadata <- plot_metadata |> filter(treatment != "DM")
+    plot_drug_info <- plot_drug_info |> filter(treatment != "DM")
+  }
+  plot_metadata <- droplevels(plot_metadata)
+
+  column_order <- plot_metadata |>
+    mutate(column_id = paste(patient, treatment, sep = "_")) |>
+    pull(column_id)
+
+  mat <- mat[, column_order, drop = FALSE]
+  col_split <- factor(plot_metadata$drug_label, levels = plot_drug_info$drug_label)
+  column_labels <- as.character(plot_metadata$patient)
+
+  col_anno <- HeatmapAnnotation(
+    class = plot_metadata$treatment_class,
+    patient = plot_metadata$patient,
+    col = list(
+      class = treatment_class_colors,
+      patient = patient_colors
+    ),
+    annotation_name_gp = gpar(fontface = "bold", fontsize = 10),
+    simple_anno_size = unit(4, "mm")
+  )
+
+  annotations <- list(
+    group = row_split
+  )
+  annotation_colors <- list(group = row_colors)
+  if (!is.null(extra_row_anno)) {
+    annotations <- c(annotations, extra_row_anno$values)
+    annotation_colors <- c(annotation_colors, extra_row_anno$colors)
+  }
+
+  row_anno <- do.call(
+    rowAnnotation,
+    c(
+      annotations,
+      list(
+        col = annotation_colors,
+        annotation_name_gp = gpar(fontface = "bold", fontsize = 10),
+        show_annotation_name = show_row_annotation_name,
+        simple_anno_size = unit(4, "mm")
+      )
+    )
+  )
+
+  max_abs <- max(abs(mat), na.rm = TRUE)
+  if (!is.finite(max_abs) || max_abs == 0) max_abs <- 1
+  max_abs <- min(max_abs, color_limit)
+  delta_fun <- circlize::colorRamp2(c(-max_abs, 0, max_abs), c("#153F80", "#F7F7F2", "#A30000"))
+
+  ht <- Heatmap(
+    mat,
+    name = "Delta\nvs DM",
+    col = delta_fun,
+    top_annotation = col_anno,
+    left_annotation = row_anno,
+    row_split = row_split,
+    column_split = col_split,
+    cluster_rows = TRUE,
+    cluster_row_slices = FALSE,
+    cluster_columns = FALSE,
+    show_row_dend = TRUE,
+    show_column_dend = FALSE,
+    row_names_gp = gpar(fontsize = row_font),
+    column_names_gp = gpar(fontsize = column_name_font),
+    column_labels = column_labels,
+    column_names_rot = 45,
+    row_title_gp = gpar(fontface = "bold", fontsize = 11),
+    column_title_gp = gpar(fontface = "bold", fontsize = column_title_font),
+    column_title_rot = 45,
+    rect_gp = gpar(col = "#8C8C8C", lwd = 0.25),
+    column_gap = unit(2, "mm"),
+    row_gap = unit(2, "mm"),
+    use_raster = TRUE
+  )
+
+  pdf_path <- file.path(figure_dir, paste0(file_stub, ".pdf"))
+  png_path <- file.path(figure_dir, paste0(file_stub, ".png"))
+  plot_height <- max(7, nrow(mat) * 0.17 + 3)
+
+  pdf(pdf_path, width = plot_width, height = plot_height)
+  draw(ht, heatmap_legend_side = legend_side, annotation_legend_side = legend_side, padding = unit(c(top_padding_mm, 8, 8, 8), "mm"))
+  dev.off()
+
+  png(png_path, width = round(plot_width * 300), height = max(2400, round(plot_height * 300)), res = 300)
+  draw(ht, heatmap_legend_side = legend_side, annotation_legend_side = legend_side, padding = unit(c(top_padding_mm, 8, 8, 8), "mm"))
+  dev.off()
+
+  invisible(list(pdf = pdf_path, png = png_path))
+}
+
+make_heatmap_matrix <- function(delta_long, row_label_col) {
+  # ComplexHeatmap expects a numeric matrix, so this helper pivots patient-treatment
+  # delta values into columns while preserving row-level annotations.
+  column_order <- metadata |>
+    mutate(column_id = paste(patient, treatment, sep = "_")) |>
+    pull(column_id)
+
+  heatmap_df <- delta_long |>
+    select(any_of(c("signature", "origin", "best_class", "best_treatment", "direction")), all_of(row_label_col), column_id, delta_log2_cpm_vs_DM) |>
+    group_by(across(-delta_log2_cpm_vs_DM)) |>
+    summarise(delta_log2_cpm_vs_DM = mean(delta_log2_cpm_vs_DM, na.rm = TRUE), .groups = "drop") |>
+    pivot_wider(names_from = column_id, values_from = delta_log2_cpm_vs_DM)
+
+  mat <- as.matrix(heatmap_df[, column_order, drop = FALSE])
+  rownames(mat) <- heatmap_df[[row_label_col]]
+  mat[is.na(mat)] <- 0
+  list(df = heatmap_df, mat = mat)
+}
+
+draw_treatment_grouped_heatmap <- function(
+  mat,
+  row_split,
+  row_colors,
+  file_stub,
+  row_font = 5.5,
+  extra_row_anno = NULL,
+  row_annotation_name = "treatment_group",
+  plot_width = 13.8,
+  column_title_font = 9,
+  column_name_font = 8,
+  top_padding_mm = 22,
+  show_row_annotation_name = TRUE,
+  color_limit = 4,
+  legend_side = "right",
+  include_dm = FALSE
+) {
+  plot_metadata <- metadata
+  plot_drug_info <- drug_info
+  if (!include_dm) {
+    plot_metadata <- plot_metadata |> filter(treatment != "DM")
+    plot_drug_info <- plot_drug_info |> filter(treatment != "DM")
+  }
+  plot_metadata <- droplevels(plot_metadata)
+
+  column_order <- plot_metadata |>
+    mutate(column_id = paste(patient, treatment, sep = "_")) |>
+    pull(column_id)
+
+  mat <- mat[, column_order, drop = FALSE]
+  col_split <- factor(plot_metadata$drug_label, levels = plot_drug_info$drug_label)
+  column_labels <- as.character(plot_metadata$patient)
+
+  col_anno <- HeatmapAnnotation(
+    class = plot_metadata$treatment_class,
+    patient = plot_metadata$patient,
+    col = list(
+      class = treatment_class_colors,
+      patient = patient_colors
+    ),
+    annotation_name_gp = gpar(fontface = "bold", fontsize = 10),
+    simple_anno_size = unit(4, "mm")
+  )
+
+  annotations <- list(row_split)
+  names(annotations) <- row_annotation_name
+  annotation_colors <- list(row_colors)
+  names(annotation_colors) <- row_annotation_name
+  if (!is.null(extra_row_anno)) {
+    annotations <- c(annotations, extra_row_anno$values)
+    annotation_colors <- c(annotation_colors, extra_row_anno$colors)
+  }
+
+  row_anno <- do.call(
+    rowAnnotation,
+    c(
+      annotations,
+      list(
+        col = annotation_colors,
+        annotation_name_gp = gpar(fontface = "bold", fontsize = 10),
+        show_annotation_name = show_row_annotation_name,
+        simple_anno_size = unit(4, "mm")
+      )
+    )
+  )
+
+  max_abs <- max(abs(mat), na.rm = TRUE)
+  if (!is.finite(max_abs) || max_abs == 0) max_abs <- 1
+  max_abs <- min(max_abs, color_limit)
+  delta_fun <- circlize::colorRamp2(c(-max_abs, 0, max_abs), c("#153F80", "#F7F7F2", "#A30000"))
+
+  ht <- Heatmap(
+    mat,
+    name = "Delta\nvs DM",
+    col = delta_fun,
+    top_annotation = col_anno,
+    left_annotation = row_anno,
+    row_split = row_split,
+    column_split = col_split,
+    cluster_rows = TRUE,
+    cluster_row_slices = FALSE,
+    cluster_columns = FALSE,
+    show_row_dend = TRUE,
+    show_column_dend = FALSE,
+    row_names_gp = gpar(fontsize = row_font),
+    column_names_gp = gpar(fontsize = column_name_font),
+    column_labels = column_labels,
+    column_names_rot = 45,
+    row_title_gp = gpar(fontface = "bold", fontsize = 11),
+    column_title_gp = gpar(fontface = "bold", fontsize = column_title_font),
+    column_title_rot = 45,
+    rect_gp = gpar(col = "#8C8C8C", lwd = 0.25),
+    column_gap = unit(2, "mm"),
+    row_gap = unit(2, "mm"),
+    use_raster = TRUE
+  )
+
+  pdf_path <- file.path(figure_dir, paste0(file_stub, ".pdf"))
+  png_path <- file.path(figure_dir, paste0(file_stub, ".png"))
+  plot_height <- max(7, nrow(mat) * 0.17 + 3)
+
+  pdf(pdf_path, width = plot_width, height = plot_height)
+  draw(ht, heatmap_legend_side = legend_side, annotation_legend_side = legend_side, padding = unit(c(top_padding_mm, 8, 8, 8), "mm"))
+  dev.off()
+
+  png(png_path, width = round(plot_width * 300), height = max(2400, round(plot_height * 300)), res = 300)
+  draw(ht, heatmap_legend_side = legend_side, annotation_legend_side = legend_side, padding = unit(c(top_padding_mm, 8, 8, 8), "mm"))
+  dev.off()
+
+  invisible(list(pdf = pdf_path, png = png_path))
+}
+```
+
+# Significant signature-gene selection
+
+Signature genes are selected independently by the paired DESeq2 treatment LRT (`FDR < 0.05`). The selected genes are then shown first by individual treatment and second with the treatment-class annotation strip.
+
+```{r signature-gene-selection}
+signature_stats <- matched_map |>
+  rename(gene_symbol = matched_gene_symbol) |>
+  left_join(all_lrt, by = "gene_symbol", relationship = "many-to-many")
+
+significant_signature_map <- signature_stats |>
+  filter(!is.na(padj), padj < 0.05) |>
+  distinct(signature, signature_gene, gene_symbol, padj) |>
+  mutate(
+    signature = factor(signature, levels = signature_levels),
+    display_gene = ifelse(signature_gene == gene_symbol, signature_gene, paste0(signature_gene, " -> ", gene_symbol)),
+    row_label = display_gene
+  ) |>
+  arrange(signature, padj)
+
+write.table(
+  signature_stats,
+  file.path(table_dir, "signature_gene_treatment_lrt_statistics.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+sig_delta <- make_delta_long(unique(significant_signature_map$gene_symbol), significant_signature_map)
+sig_heat <- make_heatmap_matrix(sig_delta, "row_label")
+sig_row_split <- factor(sig_heat$df$signature, levels = signature_levels)
+
+significant_signature_map |>
+  count(signature)
+```
+
+# Significant signature genes by individual treatment
+
+This heatmap uses the significant NF-KB, BCR, and MYC signature genes, with columns split by individual treatment. Rows are split by signature category and clustered within each category.
+
+```{r signature-treatment-heatmap}
+draw_treatment_grouped_heatmap(
+  sig_heat$mat,
+  sig_row_split,
+  signature_colors,
+  "01_significant_signature_genes_individual_treatment_delta_heatmap",
+  row_font = 6,
+  row_annotation_name = "signature",
+  plot_width = 5,
+  column_title_font = 6.2,
+  column_name_font = 6,
+  top_padding_mm = 30,
+  show_row_annotation_name = FALSE,
+  color_limit = 2,
+  legend_side = "bottom"
+)
+
+significant_signature_map |>
+  count(signature)
+
+knitr::include_graphics(file.path(figure_dir, "01_significant_signature_genes_individual_treatment_delta_heatmap.png"))
+```
+
+*Figure 1. Significant NF-KB, BCR, and MYC signature genes shown by individual treatment. Values are within-patient log2 CPM deltas relative to each patient's matched DMSO sample. Columns keep every drug separate: Ibrutinib, Acalabrutinib, Zanubrutinib, Pirtobrutinib, Nemtabrutinib, Rocbrutinib, Zelebrudomide, and Tacabrutideg. Red indicates higher expression than matched DMSO and blue indicates lower expression than matched DMSO.*
+
+# Significant signature-gene heatmap
+
+This heatmap uses the same significant NF-KB, BCR, and MYC signature genes. Rows are grouped as `NF-KB`, `BCR`, and `MYC`; columns are grouped by full drug name with a treatment-class annotation strip above the samples. Matched DMSO is used as the baseline but is not displayed as a heatmap column.
+
+```{r signature-heatmap}
+draw_delta_heatmap(
+  sig_heat$mat,
+  sig_row_split,
+  signature_colors,
+  "02_significant_signature_genes_treatment_class_delta_heatmap",
+  row_font = 6,
+  plot_width = 5,
+  column_title_font = 6.2,
+  column_name_font = 6,
+  top_padding_mm = 30,
+  show_row_annotation_name = FALSE,
+  color_limit = 2,
+  legend_side = "bottom"
+)
+
+significant_signature_map |>
+  count(signature)
+
+knitr::include_graphics(file.path(figure_dir, "02_significant_signature_genes_treatment_class_delta_heatmap.png"))
+```
+
+*Figure 2. Significant NF-KB, BCR, and MYC signature genes. This uses the same genes and drug-level column layout as Figure 1, with covalent, non-covalent, dual, and degrader treatments displayed and a treatment-class annotation strip above the samples. Matched DMSO is used only as the delta baseline.*
+
+# Compact signature heatmap and Hallmark pathway panel
+
+This section creates the pathway dot plots, the compact Hallmark top-12 dot plot, and the combined signature heatmap + Hallmark pathway panel.
+
+## Plot generation
+
+With only three patients, pathway analysis is often more informative than relying only on individual-gene FDR. Here each treatment-vs-DMSO contrast is ranked by the signed DESeq2 Wald statistic and tested separately against MSigDB Hallmark, Reactome, and GO Biological Process pathways using `fgsea`.
+
+```{r pathway-fgsea}
+get_msigdb <- function(collection, subcollection = NULL) {
+  args <- list(species = "Homo sapiens", collection = collection)
+  if (!is.null(subcollection)) args$subcollection <- subcollection
+  do.call(msigdbr::msigdbr, args)
+}
+
+format_pathway_label <- function(x) {
+  x <- gsub("^HALLMARK_", "", x)
+  x <- gsub("^REACTOME_", "", x)
+  x <- gsub("^GOBP_", "", x)
+  x <- gsub("^GO_BP_", "", x)
+  x <- gsub("_", " ", x)
+  tools::toTitleCase(tolower(x))
+}
+
+clean_msigdb_sets <- function(msigdb_df, collection_label) {
+  msigdb_df |>
+    transmute(
+      pathway_collection = collection_label,
+      pathway = gs_name,
+      gene_symbol = gene_symbol
+    ) |>
+    distinct()
+}
+
+hallmark_sets <- get_msigdb("H") |>
+  clean_msigdb_sets("HALLMARK")
+
+reactome_sets <- tryCatch(
+  get_msigdb("C2", "CP:REACTOME") |>
+    clean_msigdb_sets("REACTOME"),
+  error = function(e) {
+    message("Reactome MSigDB collection unavailable; continuing without Reactome.")
+    data.frame(pathway_collection = character(), pathway = character(), gene_symbol = character())
+  }
+)
+
+go_bp_sets <- tryCatch(
+  get_msigdb("C5", "GO:BP") |>
+    clean_msigdb_sets("GO_BP"),
+  error = function(e) {
+    message("GO Biological Process MSigDB collection unavailable; continuing without GO BP.")
+    data.frame(pathway_collection = character(), pathway = character(), gene_symbol = character())
+  }
+)
+
+pathway_gene_sets_df <- bind_rows(hallmark_sets, reactome_sets, go_bp_sets) |>
+  filter(gene_symbol %in% rownames(dds_all)) |>
+  mutate(pathway_id = paste(pathway_collection, pathway, sep = "::")) |>
+  distinct(pathway_collection, pathway, pathway_id, gene_symbol)
+
+pathway_annotation <- pathway_gene_sets_df |>
+  distinct(pathway_collection, pathway, pathway_id)
+
+pathway_list <- split(pathway_gene_sets_df$gene_symbol, pathway_gene_sets_df$pathway_id)
+
+pathway_fgsea <- lapply(setdiff(treatment_levels, "DM"), function(current_treatment) {
+  ranks_df <- wald_tables |>
+    filter(treatment == current_treatment, !is.na(stat)) |>
+    arrange(desc(abs(stat))) |>
+    distinct(gene_symbol, .keep_all = TRUE)
+
+  ranks <- setNames(ranks_df$stat, ranks_df$gene_symbol)
+  ranks <- sort(ranks, decreasing = TRUE)
+
+  fgsea::fgsea(
+    pathways = pathway_list,
+    stats = ranks,
+    minSize = 10,
+    maxSize = 500,
+    eps = 0
+  ) |>
+    as.data.frame() |>
+    rename(pathway_id = pathway) |>
+    left_join(pathway_annotation, by = "pathway_id") |>
+    mutate(
+      treatment = current_treatment,
+      leadingEdge = vapply(leadingEdge, paste, character(1), collapse = ",")
+    )
+}) |>
+  bind_rows() |>
+  select(treatment, pathway_collection, pathway, pathway_id, pval, padj, ES, NES, size, leadingEdge) |>
+  arrange(pathway_collection, treatment, padj, desc(abs(NES)))
+
+write.table(
+  pathway_fgsea,
+  file.path(pathway_table_dir, "pathway_fgsea_treatment_vs_DM.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+pathway_fdr_cutoff <- 0.05
+
+selected_pathways <- pathway_fgsea |>
+  filter(!is.na(padj)) |>
+  filter(padj < pathway_fdr_cutoff) |>
+  group_by(pathway_collection, pathway, pathway_id) |>
+  summarise(
+    best_padj = min(padj, na.rm = TRUE),
+    max_abs_NES = max(abs(NES), na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  group_by(pathway_collection) |>
+  arrange(best_padj, desc(max_abs_NES), .by_group = TRUE) |>
+  slice_head(n = 12) |>
+  ungroup() |>
+  mutate(pathway_short = format_pathway_label(pathway))
+
+pathway_plot_df <- pathway_fgsea |>
+  semi_join(selected_pathways |> select(pathway_id), by = "pathway_id") |>
+  mutate(
+    treatment = factor(treatment, levels = setdiff(treatment_levels, "DM")),
+    pathway_short = format_pathway_label(pathway),
+    fdr_size = -log10(pmax(padj, .Machine$double.xmin))
+  )
+
+pathway_max_abs <- max(abs(pathway_plot_df$NES), na.rm = TRUE)
+if (!is.finite(pathway_max_abs) || pathway_max_abs == 0) pathway_max_abs <- 1
+fdr_size_cap <- -log10(0.001)
+
+format_fdr_label <- function(fdr_value) {
+  ifelse(
+    fdr_value < 0.001,
+    formatC(fdr_value, format = "e", digits = 1),
+    formatC(fdr_value, format = "f", digits = 3)
+  )
+}
+
+make_fdr_size_scale <- function(plot_df, point_range) {
+  fdr_values <- plot_df$padj[is.finite(plot_df$padj) & plot_df$padj > 0]
+  fdr_size_limits <- range(pmin(-log10(fdr_values), fdr_size_cap), na.rm = TRUE)
+
+  if (!all(is.finite(fdr_size_limits))) {
+    fdr_size_limits <- -log10(c(0.05, 0.001))
+  }
+
+  if (diff(fdr_size_limits) == 0) {
+    fdr_size_limits <- fdr_size_limits + c(-0.15, 0.15)
+  }
+  fdr_size_limits <- fdr_size_limits + c(-0.01, 0.01)
+
+  fdr_break_df <- tibble(
+    fdr = c(max(fdr_values, na.rm = TRUE), 0.10, 0.05, min(fdr_values, na.rm = TRUE)),
+    label = c("max", "0.10", "0.05", "min")
+  ) |>
+    filter(is.finite(fdr), fdr > 0) |>
+    mutate(
+      size_break = pmin(-log10(fdr), fdr_size_cap),
+      label = case_when(
+        label == "max" ~ format_fdr_label(fdr),
+        label == "min" & fdr < 0.001 ~ "<=0.001",
+        label == "min" ~ format_fdr_label(fdr),
+        TRUE ~ label
+      )
+    ) |>
+    filter(size_break >= fdr_size_limits[1], size_break <= fdr_size_limits[2]) |>
+    mutate(size_break_key = round(size_break, 8)) |>
+    distinct(size_break_key, .keep_all = TRUE)
+
+  fdr_size_breaks <- fdr_break_df$size_break
+  fdr_size_labels <- fdr_break_df$label
+
+  scale_size_continuous(
+    range = point_range,
+    limits = fdr_size_limits,
+    breaks = fdr_size_breaks,
+    labels = fdr_size_labels,
+    name = "FDR"
+  )
+}
+
+make_pathway_dot_plot <- function(collection_name, collection_title) {
+  selected_collection <- selected_pathways |>
+    filter(pathway_collection == collection_name) |>
+    arrange(best_padj, desc(max_abs_NES))
+
+  plot_df <- pathway_plot_df |>
+    filter(pathway_collection == collection_name) |>
+    mutate(pathway_short = factor(pathway_short, levels = rev(selected_collection$pathway_short)))
+
+  if (nrow(plot_df) == 0) {
+    return(
+      ggplot() +
+        annotate("text", x = 0, y = 0, label = paste0(collection_title, ": no pathways at FDR < ", pathway_fdr_cutoff), size = 3.5) +
+        theme_void()
+    )
+  }
+
+  ggplot(plot_df, aes(treatment, pathway_short, color = NES, size = pmin(fdr_size, fdr_size_cap))) +
+    geom_point(alpha = 0.9) +
+    scale_x_discrete(expand = expansion(add = 0.18)) +
+    scale_y_discrete(expand = expansion(add = 0.65)) +
+    scale_color_gradient2(
+      low = "#153F80",
+      mid = "#F7F7F2",
+      high = "#A30000",
+      midpoint = 0,
+      limits = c(-pathway_max_abs, pathway_max_abs)
+    ) +
+    make_fdr_size_scale(plot_df, point_range = c(1.8, 7)) +
+    labs(title = collection_title, x = "Treatment vs matched DMSO", y = NULL, color = "NES") +
+    theme_bw(base_size = 8.5) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.2),
+      panel.grid.minor = element_blank(),
+      legend.position = "right"
+    )
+}
+
+pathway_dot_plots <- list(
+  HALLMARK = make_pathway_dot_plot("HALLMARK", "Hallmark pathways"),
+  REACTOME = make_pathway_dot_plot("REACTOME", "Reactome pathways"),
+  GO_BP = make_pathway_dot_plot("GO_BP", "GO Biological Process pathways")
+)
+
+wrap_pathway_label <- function(x, width = 24) {
+  vapply(
+    strwrap(x, width = width, simplify = FALSE),
+    paste,
+    collapse = "\n",
+    FUN.VALUE = character(1)
+  )
+}
+
+hallmark_compact_selected <- selected_pathways |>
+  filter(pathway_collection == "HALLMARK") |>
+  arrange(best_padj, desc(max_abs_NES)) |>
+  mutate(pathway_compact = wrap_pathway_label(pathway_short, width = 24))
+
+hallmark_compact_df <- pathway_plot_df |>
+  filter(pathway_collection == "HALLMARK") |>
+  mutate(
+    pathway_compact = wrap_pathway_label(pathway_short, width = 24),
+    pathway_compact = factor(pathway_compact, levels = rev(hallmark_compact_selected$pathway_compact))
+  )
+
+hallmark_compact_dotplot <- ggplot(hallmark_compact_df, aes(treatment, pathway_compact, color = NES, size = pmin(fdr_size, fdr_size_cap))) +
+  geom_point(alpha = 0.88) +
+  coord_cartesian(clip = "off") +
+  scale_x_discrete(expand = expansion(add = 0.32)) +
+  scale_y_discrete(expand = expansion(add = 0.32)) +
+  scale_color_gradient2(
+    low = "#153F80",
+    mid = "#F7F7F2",
+    high = "#A30000",
+    midpoint = 0,
+    limits = c(-pathway_max_abs, pathway_max_abs)
+  ) +
+  make_fdr_size_scale(hallmark_compact_df, point_range = c(0.7, 3.4)) +
+  guides(
+    size = guide_legend(order = 1, title.position = "top", nrow = 1, override.aes = list(color = "grey30")),
+    color = guide_colorbar(order = 2, title.position = "top", barwidth = unit(18, "mm"), barheight = unit(3, "mm"))
+  ) +
+  labs(title = "Hallmark top 12", x = NULL, y = NULL, color = "NES") +
+  theme_bw(base_size = 6.8) +
+  theme(
+    plot.title = element_text(face = "bold", size = 8.5, hjust = 0.5),
+    axis.text.x = element_text(size = 6, face = "plain", color = "black", angle = 45, hjust = 1, vjust = 1),
+    axis.text.y = element_text(size = 6, face = "plain", color = "black", lineheight = 0.9),
+    axis.title = element_text(size = 6.5),
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.15),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.direction = "horizontal",
+    legend.title = element_text(size = 6, face = "bold"),
+    legend.text = element_text(size = 5.2),
+    legend.spacing.x = unit(1, "mm"),
+    legend.margin = margin(0, 0, 0, 0, unit = "pt"),
+    legend.box.margin = margin(0, 0, 0, 0, unit = "pt"),
+    plot.margin = margin(3, 6, 3, 3, unit = "pt")
+  )
+
+hallmark_compact_panel_plot <- hallmark_compact_dotplot +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 8, hjust = 0.5),
+    axis.text.x = element_text(size = 6, face = "plain", color = "black", angle = 45, hjust = 1, vjust = 1),
+    axis.text.y = element_text(size = 6, face = "plain", color = "black", lineheight = 0.9),
+    plot.margin = margin(2, 2, 2, 2, unit = "pt")
+  )
+
+pathway_plot <- pathway_dot_plots$HALLMARK /
+  (pathway_dot_plots$REACTOME + theme(legend.position = "none")) /
+  (pathway_dot_plots$GO_BP + theme(legend.position = "none")) +
+  plot_layout(heights = c(1, 1, 1))
+
+ggsave(file.path(pathway_figure_dir, "01_pathway_fgsea_treatment_vs_DM_dotplot.pdf"), pathway_plot, width = 7.2, height = 11)
+ggsave(file.path(pathway_figure_dir, "01_pathway_fgsea_treatment_vs_DM_dotplot.png"), pathway_plot, width = 7.2, height = 11, dpi = 300)
+
+invisible(lapply(names(pathway_dot_plots), function(collection_name) {
+  stub <- paste0("01_pathway_fgsea_", tolower(collection_name), "_treatment_vs_DM_dotplot")
+  ggsave(file.path(pathway_figure_dir, paste0(stub, ".pdf")), pathway_dot_plots[[collection_name]], width = 7.2, height = 4.6)
+  ggsave(file.path(pathway_figure_dir, paste0(stub, ".png")), pathway_dot_plots[[collection_name]], width = 7.2, height = 4.6, dpi = 300)
+}))
+
+# compact_dotplot_width <- 2.85
+# compact_dotplot_height <- 3.50
+
+# ggsave(file.path(pathway_figure_dir, "04_hallmark_top12_compact_dotplot.pdf"), hallmark_compact_dotplot, width = compact_dotplot_width, height = compact_dotplot_height)
+# ggsave(file.path(pathway_figure_dir, "04_hallmark_top12_compact_dotplot.png"), hallmark_compact_dotplot, width = compact_dotplot_width, height = compact_dotplot_height, dpi = 300)
+# ggsave(file.path(pathway_figure_dir, "01_pathway_fgsea_hallmark_treatment_vs_DM_dotplot.pdf"), hallmark_compact_dotplot, width = compact_dotplot_width, height = compact_dotplot_height)
+# ggsave(file.path(pathway_figure_dir, "01_pathway_fgsea_hallmark_treatment_vs_DM_dotplot.png"), hallmark_compact_dotplot, width = compact_dotplot_width, height = compact_dotplot_height, dpi = 300)
+
+pathway_fgsea |>
+  group_by(pathway_collection, treatment) |>
+  summarise(
+    pathways_fdr_0.05 = sum(!is.na(padj) & padj < pathway_fdr_cutoff),
+    top_pathway = pathway[which.min(padj)],
+    top_padj = min(padj, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::include_graphics(file.path(pathway_figure_dir, "01_pathway_fgsea_treatment_vs_DM_dotplot.png"))
+```
+
+*Figure 3. Preranked pathway enrichment for each treatment vs matched DMSO, shown separately for the top 12 Hallmark, Reactome, and GO Biological Process gene sets passing FDR < 0.05. Dot color is the normalized enrichment score (NES), with red indicating positive enrichment and blue indicating negative enrichment. Dot size represents FDR as `-log10(FDR)`, so larger dots indicate stronger evidence.*
+
+This single-panel figure combines Figure 1 with the Hallmark top-12 pathway dot plot. The Hallmark panel is scaled to less than 35% of the combined figure width so it reads as a compact companion panel.
+
+```{r compact-heatmap-hallmark-panel}
+heatmap_panel_path <- file.path(figure_dir, "01_significant_signature_genes_individual_treatment_delta_heatmap.png")
+hallmark_compact_path <- tempfile(fileext = ".png")
+
+ggsave(hallmark_compact_path, hallmark_compact_panel_plot, width = compact_dotplot_width, height = compact_dotplot_height, dpi = 300)
+
+heatmap_panel <- image_read(heatmap_panel_path) |>
+  image_background("white") |>
+  image_trim(fuzz = 8)
+
+hallmark_panel <- image_read(hallmark_compact_path) |>
+  image_background("white") |>
+  image_trim(fuzz = 8)
+
+heatmap_panel <- image_resize(heatmap_panel, "900x")
+heatmap_info <- image_info(heatmap_panel)
+
+# Keep a fixed padded canvas for the Hallmark panel while resizing the plot
+# inside it, so larger pathway labels remain visible.
+hallmark_panel <- image_resize(hallmark_panel, "700x")
+hallmark_info <- image_info(hallmark_panel)
+hallmark_panel <- image_extent(
+  hallmark_panel,
+  geometry = paste0("800x", hallmark_info$height),
+  gravity = "north",
+  color = "white"
+)
+hallmark_info <- image_info(hallmark_panel)
+
+# Offset the Hallmark panel downward so the first pathway row aligns more
+# closely with the first heatmap gene row rather than the drug-label row.
+hallmark_top_offset_px <- 85
+hallmark_canvas <- image_blank(
+  width = hallmark_info$width,
+  height = heatmap_info$height,
+  color = "white"
+)
+hallmark_panel <- image_composite(
+  hallmark_canvas,
+  hallmark_panel,
+  offset = paste0("+0+", hallmark_top_offset_px)
+)
+
+compact_panel <- image_append(c(heatmap_panel, hallmark_panel))
+
+compact_panel_png <- file.path(pathway_figure_dir, "04_compact_signature_heatmap_hallmark_top12_panel.png")
+compact_panel_pdf <- file.path(pathway_figure_dir, "04_compact_signature_heatmap_hallmark_top12_panel.pdf")
+
+image_write(compact_panel, compact_panel_png)
+
+compact_info <- image_info(compact_panel)
+pdf(compact_panel_pdf, width = 8, height = 8 * compact_info$height / compact_info$width)
+grid.newpage()
+grid.raster(as.raster(compact_panel), width = unit(1, "npc"), height = unit(1, "npc"), interpolate = TRUE)
+dev.off()
+
+knitr::include_graphics(compact_panel_png)
+```
+
+*Figure 4. Compact panel combining the individual-treatment NF-KB/BCR/MYC signature heatmap with the Hallmark top-12 pathway dot plot. The heatmap uses treatment-minus-matched-DMSO log2 CPM deltas, while the Hallmark dot plot shows FDR-significant pathway enrichment ranked by signed Wald statistic.*
+
+**End of shortened report.** This shortened RMarkdown intentionally stops after the significant signature heatmaps, pathway dot plots, the compact Hallmark top-12 dot plot, and the compact heatmap + Hallmark top-12 panel. Downstream exploratory sections from the full report were removed from this copy.
+
+# Session information
+
+This section records the R session used to render this shortened report, including loaded package versions. The same information is also written to the results table folder.
+
+```{r session-info}
+session_info_lines <- capture.output(sessionInfo())
+writeLines(
+  session_info_lines,
+  file.path(table_dir, "session_info_heatmap_pathways_report.txt")
+)
+cat(paste(session_info_lines, collapse = "\n"))
+```
